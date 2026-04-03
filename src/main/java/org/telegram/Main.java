@@ -4,8 +4,8 @@ import org.json.*;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.TelegramBotsApi;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
-import org.telegram.telegrambots.meta.api.methods.BotApiMethod;
 import org.telegram.telegrambots.meta.api.methods.CopyMessage;
+import org.telegram.telegrambots.meta.api.methods.ForwardMessage;
 import org.telegram.telegrambots.meta.api.methods.groupadministration.ApproveChatJoinRequest;
 import org.telegram.telegrambots.meta.api.methods.groupadministration.GetChatMember;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
@@ -33,23 +33,26 @@ public class Main extends TelegramLongPollingBot {
     private static final String BOT_TOKEN            = "8456287018:AAHWtv88IGgH-UL9K3NZ3UZRIJriAm9aHu4";
     private static final String BOT_USERNAME         = "film1fy_bot";
 
-    // ═══════════════════════════════════════════════════
-    //  🔧 FIX 1: Reklama yuboriladigan kanal IDlari
-    //  Bot shu kanallarda ADMIN bo'lishi kerak!
-    // ═══════════════════════════════════════════════════
+    // Videolarni saqlash uchun maxsus kanal — bot shu kanalda ADMIN bo'lishi SHART!
+    private static final long STORAGE_CHANNEL_ID = -1003618718316L;
+
+    private static final int MAX_MSG_LEN = 3800;
+
+    // Reklama yuboriladigan kanallar — bot ADMIN bo'lishi SHART!
     private static final List<Long> BROADCAST_CHANNEL_IDS = List.of(
             -1003705247131L,
             -1003837469684L
     );
 
-    private final List<Channel> channels = new CopyOnWriteArrayList<>(List.of(
-            new Channel("KANAL 1", -1003705247131L, "https://t.me/+697sc9ktBMQ3YmVi"),
-            new Channel("KANAL 2", -1003837469684L, "https://t.me/+jCnxEHBOLogyMDMy"),
-            new Channel("KANAL 3", -1003896851782L, "https://t.me/+3rcCxojAHT8xYjI6")
-    ));
+    record Channel(String name, long id, String link, boolean hasJoinRequest) {}
+    // msgRefs formati: "chatId:messageId" yoki "file:fileId"
+    record Movie(String code, String title, List<String> msgRefs) {}
 
-    record Movie(String code, String title, List<String> fileIds) {}
-    record Channel(String name, long id, String link) {}
+    private final List<Channel> channels = new CopyOnWriteArrayList<>(List.of(
+            new Channel("KANAL 1", -1003705247131L, "https://t.me/+697sc9ktBMQ3YmVi", true),
+            new Channel("KANAL 2", -1003837469684L, "https://t.me/+jCnxEHBOLogyMDMy", false),
+            new Channel("KANAL 3", -1003896851782L, "https://t.me/+3rcCxojAHT8xYjI6", true)
+    ));
 
     private static final String DATA_DIR = System.getenv("RAILWAY_ENVIRONMENT") != null
             ? "/data/kinobot/"
@@ -63,6 +66,7 @@ public class Main extends TelegramLongPollingBot {
     private final Set<Long> dirtyUsers = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
+    // ═══ DB ═══════════════════════════════════════════════
     private void initDb() {
         try {
             Files.createDirectories(Paths.get(DATA_DIR));
@@ -72,66 +76,58 @@ public class Main extends TelegramLongPollingBot {
             channelsJson = loadJson("channels.json");
             loadChannelsFromDb();
             scheduler.scheduleAtFixedRate(this::flushUsers, 30, 30, TimeUnit.SECONDS);
-            System.out.println("✅ JSON data tayyor: " + DATA_DIR);
-        } catch (IOException e) {
-            System.err.println("❌ initDb xato: " + e.getMessage());
-        }
+            System.out.println("✅ DB tayyor: " + DATA_DIR);
+        } catch (IOException e) { System.err.println("❌ initDb: " + e.getMessage()); }
     }
 
     private void flushUsers() {
-        if (!dirtyUsers.isEmpty()) {
-            saveJson("users.json", usersJson);
-            dirtyUsers.clear();
-        }
+        if (!dirtyUsers.isEmpty()) { saveJson("users.json", usersJson); dirtyUsers.clear(); }
     }
 
-    private JSONObject loadJson(String filename) {
+    private JSONObject loadJson(String f) {
         try {
-            Path p = Paths.get(DATA_DIR + filename);
+            Path p = Paths.get(DATA_DIR + f);
             if (Files.exists(p)) return new JSONObject(Files.readString(p));
         } catch (Exception ignored) {}
         return new JSONObject();
     }
 
-    private synchronized void saveJson(String filename, JSONObject data) {
+    private synchronized void saveJson(String f, JSONObject d) {
         try {
-            Files.writeString(Paths.get(DATA_DIR + filename),
-                    data.toString(2),
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.TRUNCATE_EXISTING);
-        } catch (IOException e) {
-            System.err.println("saveJson xato: " + e.getMessage());
-        }
+            Files.writeString(Paths.get(DATA_DIR + f), d.toString(2),
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) { System.err.println("saveJson: " + e.getMessage()); }
     }
 
     // ─── KANALLAR ───────────────────────────────────────
     private void loadChannelsFromDb() {
         if (channelsJson.isEmpty()) {
             for (Channel ch : channels)
-                channelsJson.put(String.valueOf(ch.id()),
-                        new JSONObject().put("name", ch.name()).put("link", ch.link()));
+                channelsJson.put(String.valueOf(ch.id()), new JSONObject()
+                        .put("name", ch.name()).put("link", ch.link())
+                        .put("hasJoinRequest", ch.hasJoinRequest()));
             saveJson("channels.json", channelsJson);
         } else {
             channels.clear();
             for (String cid : channelsJson.keySet()) {
                 JSONObject o = channelsJson.getJSONObject(cid);
-                channels.add(new Channel(o.getString("name"), Long.parseLong(cid), o.getString("link")));
+                channels.add(new Channel(o.getString("name"), Long.parseLong(cid),
+                        o.getString("link"), o.optBoolean("hasJoinRequest", false)));
             }
         }
     }
 
-    private boolean dbAddChannel(String name, long cid, String link) {
-        channelsJson.put(String.valueOf(cid), new JSONObject().put("name", name).put("link", link));
+    private void dbAddChannel(String name, long cid, String link, boolean hjr) {
+        channelsJson.put(String.valueOf(cid), new JSONObject()
+                .put("name", name).put("link", link).put("hasJoinRequest", hjr));
         saveJson("channels.json", channelsJson);
         channels.removeIf(c -> c.id() == cid);
-        channels.add(new Channel(name, cid, link));
-        return true;
+        channels.add(new Channel(name, cid, link, hjr));
     }
 
     private boolean dbDelChannel(long cid) {
-        String key = String.valueOf(cid);
-        if (!channelsJson.has(key)) return false;
-        channelsJson.remove(key);
+        if (!channelsJson.has(String.valueOf(cid))) return false;
+        channelsJson.remove(String.valueOf(cid));
         saveJson("channels.json", channelsJson);
         channels.removeIf(c -> c.id() == cid);
         return true;
@@ -140,62 +136,58 @@ public class Main extends TelegramLongPollingBot {
     // ─── ADMINLAR ───────────────────────────────────────
     private boolean isAdminInDb(long uid) { return adminsJson.has(String.valueOf(uid)); }
 
-    private boolean dbAddAdmin(long id, String uname, long addedBy) {
+    private void dbAddAdmin(long id, String uname, long by) {
         adminsJson.put(String.valueOf(id), new JSONObject()
-                .put("username", uname != null ? uname : "").put("addedBy", addedBy));
+                .put("username", uname != null ? uname : "").put("addedBy", by));
         saveJson("admins.json", adminsJson);
-        return true;
     }
 
     private boolean dbDelAdmin(long id) {
-        String key = String.valueOf(id);
-        if (!adminsJson.has(key)) return false;
-        adminsJson.remove(key);
+        if (!adminsJson.has(String.valueOf(id))) return false;
+        adminsJson.remove(String.valueOf(id));
         saveJson("admins.json", adminsJson);
         return true;
     }
 
-    private List<long[]> dbListAdmins() {
-        List<long[]> list = new ArrayList<>();
-        for (String key : adminsJson.keySet()) list.add(new long[]{Long.parseLong(key)});
+    private List<Long> dbListAdmins() {
+        List<Long> list = new ArrayList<>();
+        for (String k : adminsJson.keySet()) list.add(Long.parseLong(k));
         return list;
     }
 
     // ─── FILMLAR ────────────────────────────────────────
-    private boolean dbSaveMovie(String code, String title, List<String> fileIds) {
+    private void dbSaveMovie(String code, String title, List<String> msgRefs) {
         String t = (title != null && !title.isBlank()) ? title : code;
-        moviesJson.put(code, new JSONObject().put("title", t).put("fileIds", new JSONArray(fileIds)));
+        moviesJson.put(code, new JSONObject()
+                .put("title", t)
+                .put("msgRefs", new JSONArray(msgRefs)));
         saveJson("movies.json", moviesJson);
-        movies.put(code, new Movie(code, t, new ArrayList<>(fileIds)));
-        System.out.println("✅ Saqlandi: " + code + " | " + t + " | " + fileIds.size() + " qism");
-        return true;
+        movies.put(code, new Movie(code, t, new ArrayList<>(msgRefs)));
+        System.out.println("✅ " + code + " | " + t + " | " + msgRefs.size() + "q");
     }
 
     private boolean dbDelMovie(String code) {
         if (!moviesJson.has(code)) return false;
-        moviesJson.remove(code);
-        saveJson("movies.json", moviesJson);
-        movies.remove(code);
+        moviesJson.remove(code); saveJson("movies.json", moviesJson); movies.remove(code);
         return true;
     }
 
-    private boolean dbUpdateTitle(String code, String newTitle) {
+    private boolean dbUpdateTitle(String code, String title) {
         if (!moviesJson.has(code)) return false;
-        moviesJson.getJSONObject(code).put("title", newTitle);
+        moviesJson.getJSONObject(code).put("title", title);
         saveJson("movies.json", moviesJson);
         Movie mv = movies.get(code);
-        if (mv != null) movies.put(code, new Movie(mv.code(), newTitle, mv.fileIds()));
+        if (mv != null) movies.put(code, new Movie(mv.code(), title, mv.msgRefs()));
         return true;
     }
 
     private boolean dbUpdateCode(String oldCode, String newCode) {
         if (!moviesJson.has(oldCode)) return false;
-        JSONObject data = moviesJson.getJSONObject(oldCode);
-        moviesJson.remove(oldCode);
-        moviesJson.put(newCode, data);
+        JSONObject d = moviesJson.getJSONObject(oldCode);
+        moviesJson.remove(oldCode); moviesJson.put(newCode, d);
         saveJson("movies.json", moviesJson);
         Movie mv = movies.remove(oldCode);
-        if (mv != null) movies.put(newCode, new Movie(newCode, mv.title(), mv.fileIds()));
+        if (mv != null) movies.put(newCode, new Movie(newCode, mv.title(), mv.msgRefs()));
         return true;
     }
 
@@ -203,15 +195,22 @@ public class Main extends TelegramLongPollingBot {
         movies.clear();
         for (String code : moviesJson.keySet()) {
             JSONObject o = moviesJson.getJSONObject(code);
-            JSONArray arr = o.getJSONArray("fileIds");
-            List<String> ids = new ArrayList<>();
-            for (int i = 0; i < arr.length(); i++) ids.add(arr.getString(i));
-            movies.put(code, new Movie(code, o.getString("title"), ids));
+            List<String> refs = new ArrayList<>();
+            // Yangi format: msgRefs
+            if (o.has("msgRefs")) {
+                JSONArray arr = o.getJSONArray("msgRefs");
+                for (int i = 0; i < arr.length(); i++) refs.add(arr.getString(i));
+            }
+            // Eski format: fileIds — migratsiya qilish
+            else if (o.has("fileIds")) {
+                JSONArray arr = o.getJSONArray("fileIds");
+                for (int i = 0; i < arr.length(); i++) refs.add("file:" + arr.getString(i));
+            }
+            movies.put(code, new Movie(code, o.getString("title"), refs));
         }
-        System.out.println("✅ " + movies.size() + " ta film xotiraga yuklandi.");
+        System.out.println("✅ " + movies.size() + " ta film yuklandi.");
     }
 
-    // 🔧 FIX 3: Faqat admin uchun qidiruv metodi
     private List<Movie> searchMoviesAdmin(String kw) {
         String q = kw.toLowerCase();
         return movies.values().stream()
@@ -234,13 +233,12 @@ public class Main extends TelegramLongPollingBot {
 
     private List<Long> getAllUserIds() {
         List<Long> ids = new ArrayList<>();
-        for (String key : usersJson.keySet()) ids.add(Long.parseLong(key));
+        for (String k : usersJson.keySet()) ids.add(Long.parseLong(k));
         return ids;
     }
 
     // ─── ADMIN TEKSHIRUVI ───────────────────────────────
     private boolean isSuperAdmin(long uid) { return uid == SUPER_ADMIN_ID; }
-
     private boolean isAdmin(long uid, String uname) {
         if (uid == SUPER_ADMIN_ID) return true;
         if (uname != null && uname.equalsIgnoreCase(SUPER_ADMIN_USERNAME)) return true;
@@ -254,7 +252,7 @@ public class Main extends TelegramLongPollingBot {
         WAITING_BROADCAST,
         WAITING_DEL_CODE,
         WAITING_SEARCH,
-        WAITING_CH_NAME, WAITING_CH_ID, WAITING_CH_LINK,
+        WAITING_CH_NAME, WAITING_CH_ID, WAITING_CH_TYPE, WAITING_CH_LINK,
         WAITING_ADD_ADMIN,
         WAITING_EDIT_CODE, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE, WAITING_EDIT_VIDEOS
     }
@@ -269,6 +267,7 @@ public class Main extends TelegramLongPollingBot {
     @Override public String getBotUsername() { return BOT_USERNAME; }
     @Override public String getBotToken()    { return BOT_TOKEN; }
 
+    // ═══ ASOSIY UPDATE HANDLER ════════════════════════════
     @Override
     public void onUpdateReceived(Update update) {
         try {
@@ -292,22 +291,12 @@ public class Main extends TelegramLongPollingBot {
 
             dbSaveUser(userId, uname, fname);
 
-            // 🔧 FIX 5: Admin bo'lsa faqat admin panelga — user xabar ko'rmasin
-            if (isAdmin(userId, uname)) {
-                handleAdmin(msg);
-                return;
-            }
+            // Admin bo'lsa — faqat admin paneliga
+            if (isAdmin(userId, uname)) { handleAdmin(msg); return; }
 
-            // Oddiy user uchun
             if (msg.hasText() && msg.getText().startsWith("/start")) {
-                if (!subscribedAll(userId)) {
-                    sendSubMsg(chatId, userId);
-                } else {
-                    sendMsg(chatId,
-                            "👋 <b>Salom, " + escHtml(fname) + "!</b>\n\n"
-                                    + "🎬 Film kodini yuboring:\n<i>Masalan: <code>0001</code></i>",
-                            userKb());
-                }
+                if (!subscribedAll(userId)) sendSubMsg(chatId, userId);
+                else sendWelcome(chatId, fname);
                 return;
             }
 
@@ -315,17 +304,15 @@ public class Main extends TelegramLongPollingBot {
 
             if (msg.hasText()) {
                 String txt = msg.getText().trim();
-                if (!txt.startsWith("/")) {
-                    // 🔧 FIX 3: User har qanday matn yuborse faqat aniq kod bilan izlaydi
-                    sendFilm(chatId, txt);
-                }
+                if (!txt.startsWith("/")) sendFilm(chatId, txt);
             }
+
         } catch (Exception e) {
-            System.err.println("❌ Xato: " + e.getMessage());
+            System.err.println("❌ onUpdate: " + e.getMessage());
         }
     }
 
-    // ─── A'ZOLIK ────────────────────────────────────────
+    // ═══ A'ZOLIK ══════════════════════════════════════════
     private boolean subscribedAll(long uid) {
         if (isAdmin(uid, null)) return true;
         for (Channel ch : channels) if (!subscribed(uid, ch.id())) return false;
@@ -339,7 +326,10 @@ public class Main extends TelegramLongPollingBot {
             String s = execute(r).getStatus();
             return s.equals("member") || s.equals("administrator")
                     || s.equals("creator") || s.equals("restricted");
-        } catch (TelegramApiException e) { return false; } // 🔧 FIX: xato bo'lsa false
+        } catch (TelegramApiException e) {
+            System.err.println("subscribed xato ch=" + chId + ": " + e.getMessage());
+            return false;
+        }
     }
 
     private void sendSubMsg(long chatId, long uid) {
@@ -347,34 +337,214 @@ public class Main extends TelegramLongPollingBot {
         for (Channel ch : channels) {
             boolean ok = subscribed(uid, ch.id());
             InlineKeyboardButton b = new InlineKeyboardButton();
-            if (ok) { b.setText("✅ " + ch.name()); b.setCallbackData("noop"); }
-            else    { b.setText("📢 " + ch.name() + " — Obuna bo'lish"); b.setUrl(ch.link()); }
+            if (ok) {
+                b.setText("✅ " + ch.name()); b.setCallbackData("noop");
+            } else {
+                b.setText((ch.hasJoinRequest() ? "🔐 " : "📢 ") + ch.name()
+                        + (ch.hasJoinRequest() ? " (So'rov)" : "") + " — Ulaning");
+                b.setUrl(ch.link());
+            }
             rows.add(List.of(b));
         }
         InlineKeyboardButton chk = new InlineKeyboardButton();
-        chk.setText("✅ Tekshirish"); chk.setCallbackData("chk");
+        chk.setText("🔄 A'zolikni tekshirish"); chk.setCallbackData("chk");
         rows.add(List.of(chk));
+
         SendMessage m = new SendMessage();
         m.setChatId(String.valueOf(chatId));
-        m.setText("⛔ <b>Botdan foydalanish uchun kanallarga obuna bo'ling!</b>\n\n"
-                + "📢 Har bir kanalga obuna bo'ling, keyin <b>✅ Tekshirish</b> ni bosing:");
-        m.setParseMode("HTML"); m.setReplyMarkup(new InlineKeyboardMarkup(rows)); exec(m);
+        m.setText(
+            "🎬 <b>FILMIFY</b>\n" +
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+            "⛔ <b>Botdan foydalanish uchun\n" +
+            "quyidagi kanallarga ulaning!</b>\n\n" +
+            "Ulangach ✅ bo'ladi.\n" +
+            "Keyin <b>🔄 Tekshirish</b> ni bosing.\n\n" +
+            "💡 <i>🔐 — so'rov yuboring,\n" +
+            "bot avtomatik qabul qiladi.</i>"
+        );
+        m.setParseMode("HTML");
+        m.setReplyMarkup(new InlineKeyboardMarkup(rows));
+        execMsg(m);
     }
 
-    // ─── CALLBACK ───────────────────────────────────────
+    private void sendWelcome(long chatId, String fname) {
+        SendMessage m = new SendMessage();
+        m.setChatId(String.valueOf(chatId));
+        m.setText(
+            "🎬 <b>FILMIFY BOT</b>\n" +
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+            "👋 Salom, <b>" + escHtml(fname) + "</b>!\n\n" +
+            "🍿 <b>Qanday ishlaydi?</b>\n\n" +
+            "  1️⃣  Kanaldan film <b>kodini</b> oling\n" +
+            "  2️⃣  Kodni botga <b>yuboring</b>\n" +
+            "  3️⃣  Film <b>darhol</b> keladi!\n\n" +
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+            "🔍 Film kodini kiriting:\n" +
+            "<code>Masalan: 0001</code>"
+        );
+        m.setParseMode("HTML");
+        m.setReplyMarkup(userKb());
+        execMsg(m);
+    }
+
+    // ═══ FILM QIDIRISH — FAQAT ANIQ KOD ════════════════════
+    // User faqat aniq kodni yuborganida topiladi.
+    // Noto'g'ri kod — "topilmadi" xabari, o'xshash ko'rsatilmaydi.
+    private Movie findMovie(String input) {
+        // Kiruvchi matnni tozalash
+        String raw = input.trim();
+
+        // 1. Aynan shu kod bilan qidirish (katta harfga o'girib)
+        Movie mv = movies.get(raw.toUpperCase());
+        if (mv != null) return mv;
+
+        // 2. Faqat raqam bo'lsa — 4 xonali padding bilan qidirish
+        // Masalan user "1" yuborganda "0001" topilishi uchun
+        if (raw.matches("\\d{1,4}")) {
+            String padded = String.format("%04d", Integer.parseInt(raw));
+            mv = movies.get(padded);
+            if (mv != null) return mv;
+        }
+
+        return null; // Topilmadi — o'xshash KO'RSATILMAYDI
+    }
+
+    // ═══ FILM YUBORISH — ASOSIY TUZATISH ═════════════════════
+    private void sendFilm(long chatId, String input) {
+        Movie mv = findMovie(input);
+
+        if (mv == null) {
+            sendText(chatId,
+                "❌ <b>Film topilmadi!</b>\n" +
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+                "🔍 Kiritilgan kod: <code>" + escHtml(input.trim()) + "</code>\n\n" +
+                "📌 <b>Nima qilish kerak?</b>\n" +
+                "• Kodni Instagram yoki Telegram kanaldan oling\n" +
+                "• Kodni to'g'ri kiriting\n\n" +
+                "💡 <i>Misol: <code>0001</code></i>");
+            return;
+        }
+
+        int total = mv.msgRefs().size();
+
+        // Bir nechta qism bo'lsa — oldindan xabar
+        if (total > 1) {
+            sendText(chatId,
+                "🎬 <b>" + escHtml(mv.title()) + "</b>\n" +
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                "📽 Jami <b>" + total + "</b> qism\n" +
+                "⏳ <i>Yuklanmoqda...</i>");
+        }
+
+        for (int i = 0; i < mv.msgRefs().size(); i++) {
+            String ref = mv.msgRefs().get(i);
+            String cap = total == 1
+                    ? "🎬 <b>" + escHtml(mv.title()) + "</b>\n\n🤖 @" + BOT_USERNAME
+                    : "🎬 <b>" + escHtml(mv.title()) + "</b>\n📌 <b>" + (i + 1) + "-qism</b> / " + total + "\n\n🤖 @" + BOT_USERNAME;
+
+            boolean sent = trySendRef(chatId, ref, cap);
+
+            if (!sent) {
+                System.err.println("❌ Yuborib bo'lmadi: ref=" + ref + " → chatId=" + chatId);
+                sendText(chatId, "⚠️ " + (i + 1) + "-qismni yuborishda xato yuz berdi.");
+            }
+
+            sleep(300);
+        }
+    }
+
+    // ═══ REF ORQALI YUBORISH — barcha formatlarni qo'llab-quvvatlaydi ═══
+    private boolean trySendRef(long chatId, String ref, String caption) {
+        // Format 1: "chatId:messageId" — CopyMessage
+        if (ref.contains(":") && !ref.startsWith("file:")) {
+            try {
+                String[] parts = ref.split(":", 2);
+                long fromChatId   = Long.parseLong(parts[0]);
+                int  messageId    = Integer.parseInt(parts[1]);
+
+                CopyMessage cp = new CopyMessage();
+                cp.setChatId(String.valueOf(chatId));
+                cp.setFromChatId(String.valueOf(fromChatId));
+                cp.setMessageId(messageId);
+                cp.setCaption(caption);
+                cp.setParseMode("HTML");
+                execute(cp);
+                System.out.println("✅ CopyMessage: " + ref + " → " + chatId);
+                return true;
+            } catch (Exception e) {
+                System.err.println("❌ CopyMessage xato (" + ref + "): " + e.getMessage());
+                // Pastga tushib SendVideo ham urinamiz
+            }
+        }
+
+        // Format 2: "file:fileId" yoki to'g'ri fileId (eski ma'lumotlar uchun)
+        try {
+            String fileId = ref.startsWith("file:") ? ref.substring(5) : ref;
+            SendVideo v = new SendVideo();
+            v.setChatId(String.valueOf(chatId));
+            v.setVideo(new InputFile(fileId));
+            v.setCaption(caption);
+            v.setParseMode("HTML");
+            execute(v);
+            System.out.println("✅ SendVideo: fileId=" + fileId.substring(0, Math.min(20, fileId.length())) + "...");
+            return true;
+        } catch (Exception e) {
+            System.err.println("❌ SendVideo xato: " + e.getMessage());
+            return false;
+        }
+    }
+
+    // ═══ VIDEO SAQLASH ════════════════════════════════════════
+    // Videoni kanaldan forward qilsa → asl chatId:messageId
+    // To'g'ridan-to'g'ri yuborilsa → STORAGE_CHANNEL_ID ga forward qilib saqlanadi
+    private String saveMsgRef(Message msg) {
+        // 1. Kanaldan forward — eng ishonchli usul
+        if (msg.getForwardFromChat() != null) {
+            Chat fc = msg.getForwardFromChat();
+            if ("channel".equals(fc.getType()) || "supergroup".equals(fc.getType())) {
+                String ref = fc.getId() + ":" + msg.getForwardFromMessageId();
+                System.out.println("📤 Kanaldan forward ref: " + ref);
+                return ref;
+            }
+        }
+
+        // 2. Boshqa holat → saqlash kanaliga forward qilamiz
+        try {
+            ForwardMessage fw = new ForwardMessage();
+            fw.setChatId(String.valueOf(STORAGE_CHANNEL_ID));
+            fw.setFromChatId(String.valueOf(msg.getChatId()));
+            fw.setMessageId(msg.getMessageId());
+            Message saved = execute(fw);
+            String ref = STORAGE_CHANNEL_ID + ":" + saved.getMessageId();
+            System.out.println("📦 Storage kanaliga saqlandi: " + ref);
+            return ref;
+        } catch (TelegramApiException e) {
+            System.err.println("❌ Storage kanal xato: " + e.getMessage());
+            // Oxirgi chora: fileId bilan saqlaymiz (eski usul)
+            if (msg.hasVideo()) {
+                String fileId = msg.getVideo().getFileId();
+                System.out.println("⚠️ fileId bilan saqlandi: " + fileId.substring(0, 20) + "...");
+                return "file:" + fileId;
+            }
+            return msg.getChatId() + ":" + msg.getMessageId();
+        }
+    }
+
+    // ═══ CALLBACK HANDLER ═════════════════════════════════
     private void handleCallback(CallbackQuery cb) {
         long chatId  = cb.getMessage().getChatId();
         long uid     = cb.getFrom().getId();
         String uname = cb.getFrom().getUserName();
+        String fname = cb.getFrom().getFirstName();
         String data  = cb.getData();
+
         try { AnswerCallbackQuery a = new AnswerCallbackQuery(); a.setCallbackQueryId(cb.getId()); execute(a); }
         catch (Exception ignored) {}
 
         if ("noop".equals(data)) return;
 
         if ("chk".equals(data)) {
-            if (subscribedAll(uid))
-                sendMsg(chatId, "✅ <b>Barcha kanallarga obuna bo'ldingiz!</b>\n\n🎬 Film kodini yuboring:", userKb());
+            if (subscribedAll(uid)) sendWelcome(chatId, fname != null ? fname : "Do'stim");
             else sendSubMsg(chatId, uid);
             return;
         }
@@ -384,18 +554,32 @@ public class Main extends TelegramLongPollingBot {
         if (data.startsWith("del_ch:")) {
             long cid = Long.parseLong(data.split(":")[1]);
             sendText(chatId, dbDelChannel(cid) ? "✅ Kanal o'chirildi!" : "❌ Topilmadi.");
+
         } else if (data.startsWith("del_admin:")) {
             long aid2 = Long.parseLong(data.split(":")[1]);
             if (aid2 == SUPER_ADMIN_ID) { sendText(chatId, "⛔ Super adminni o'chirib bo'lmaydi!"); return; }
             if (!isSuperAdmin(uid))     { sendText(chatId, "⛔ Faqat Super Admin!"); return; }
             sendText(chatId, dbDelAdmin(aid2) ? "✅ Admin o'chirildi!" : "❌ Topilmadi.");
+
+        } else if (data.equals("ch_type:request") || data.equals("ch_type:public")) {
+            boolean isReq = data.equals("ch_type:request");
+            String raw = pendingData.getOrDefault(uid, "||");
+            String[] parts = raw.split("\\|\\|", 2);
+            String name   = parts.length > 0 ? parts[0] : "Kanal";
+            String cidStr = parts.length > 1 ? parts[1] : "0";
+            pendingData.put(uid, name + "||" + cidStr + "||" + (isReq ? "request" : "public"));
+            states.put(uid, State.WAITING_CH_LINK);
+            sendText(chatId,
+                "✅ Tur: " + (isReq ? "🔐 So'rovli" : "📢 Ochiq") + "\n\n" +
+                "4️⃣ Invite link yuboring:\n<code>https://t.me/+xxxxx</code>\n\n/cancel");
+
         } else if (data.startsWith("edit:")) {
             String[] parts = data.split(":", 3);
             if (parts.length < 3) return;
             String field = parts[1], code = parts[2];
             if (field.equals("cancel")) {
                 states.put(uid, State.NONE); clearPending(uid);
-                sendMsg(chatId, "❌ Bekor qilindi.", adminKb(uid)); return;
+                sendKb(chatId, "❌ Bekor qilindi.", adminKb(uid)); return;
             }
             pendingCode.put(uid, code);
             switch (field) {
@@ -406,39 +590,16 @@ public class Main extends TelegramLongPollingBot {
                     pendingTitle.put(uid, mv != null ? mv.title() : code);
                     pendingVids.put(uid, new ArrayList<>());
                     states.put(uid, State.WAITING_EDIT_VIDEOS);
-                    sendText(chatId, "🎬 Hozirda <b>" + (mv != null ? mv.fileIds().size() : 0) + "</b> ta video.\n\n"
-                            + "Yangi videolarni forward qiling.\n⚡ Har video kelganda avtomatik saqlanadi!\n\n/cancel");
+                    sendText(chatId,
+                        "🎬 Hozirda <b>" + (mv != null ? mv.msgRefs().size() : 0) + "</b> ta qism.\n\n" +
+                        "Yangi videolarni <b>kanaldan forward qiling</b>.\n\n/cancel");
                 }
             }
         }
     }
 
-    // ─── FILM YUBORISH ──────────────────────────────────
-    // 🔧 FIX 3: Faqat ANIQ kod — o'xshash ko'rsatilmaydi
-    private void sendFilm(long chatId, String code) {
-        Movie mv = movies.get(code.toUpperCase());
-        if (mv == null) {
-            sendText(chatId,
-                "❌ <b>Film topilmadi!</b>\n\n"
-                + "📌 <i>Kodni Instagram yoki Telegram kanalimizdan oling va to'g'ri kiriting.</i>");
-            return;
-        }
-        int total = mv.fileIds().size();
-        if (total > 1) sendText(chatId, "🎬 <b>" + escHtml(mv.title()) + "</b>\n📽 Jami <b>" + total + "</b> qism yuborilmoqda...");
-        for (int i = 0; i < mv.fileIds().size(); i++) {
-            String cap = total == 1
-                    ? "🎬 <b>" + escHtml(mv.title()) + "</b>"
-                    : "🎬 <b>" + escHtml(mv.title()) + "</b>\n📌 <b>" + (i+1) + "-qism</b> / " + total;
-            SendVideo v = new SendVideo();
-            v.setChatId(String.valueOf(chatId)); v.setVideo(new InputFile(mv.fileIds().get(i)));
-            v.setCaption(cap); v.setParseMode("HTML");
-            try { execute(v); } catch (TelegramApiException e) { System.err.println("video xato: " + e.getMessage()); }
-            try { Thread.sleep(200); } catch (InterruptedException ignored) {}
-        }
-    }
-
-    // ─── ADMIN HANDLER ───────────────────────────────────
-    private boolean handleAdmin(Message msg) {
+    // ═══ ADMIN HANDLER ════════════════════════════════════
+    private void handleAdmin(Message msg) {
         long aid     = msg.getFrom().getId();
         String uname = msg.getFrom().getUserName();
         String fname = msg.getFrom().getFirstName();
@@ -447,271 +608,285 @@ public class Main extends TelegramLongPollingBot {
 
         if (txt.startsWith("/start") || txt.equals("/admin") || txt.equals("👑 Admin panel")) {
             states.put(aid, State.NONE); clearPending(aid);
-            sendMsg(aid, buildAdminHeader(aid, fname), adminKb(aid)); return true;
+            sendKb(aid, buildAdminHeader(aid, fname), adminKb(aid)); return;
         }
-        if (txt.equals("/myid")) {
-            sendText(aid, "🆔 ID: <code>" + aid + "</code>\n👤 @" + (uname != null ? uname : "yo'q")
-                    + "\n🏅 " + (isSuperAdmin(aid) ? "👑 Super Admin" : "🛡 Admin")); return true;
+        if (txt.equals("/cancel") || txt.equals("🚫 Bekor qilish")) {
+            states.put(aid, State.NONE); clearPending(aid);
+            sendKb(aid, "❌ Bekor qilindi.", adminKb(aid)); return;
         }
         if (txt.equals("/addmovie") || txt.equals("➕ Film qo'shish")) {
             states.put(aid, State.WAITING_CODE); pendingVids.put(aid, new ArrayList<>()); pendingTitle.remove(aid);
-            sendText(aid, "🎬 <b>Film qo'shish</b>\n\n1️⃣ Film kodini kiriting:\n<i>Masalan: <code>0001</code></i>\n\n/cancel"); return true;
+            sendText(aid,
+                "🎬 <b>Film qo'shish</b>\n\n" +
+                "1️⃣ Film kodini kiriting:\n<code>Masalan: 0001</code>\n\n/cancel"); return;
         }
         if (txt.equals("❌ Film o'chirish") || txt.startsWith("/delmovie")) {
             if (txt.startsWith("/delmovie ")) {
                 String code = txt.substring(10).trim().toUpperCase();
-                sendMsg(aid, dbDelMovie(code) ? "✅ <code>"+code+"</code> — o'chirildi." : "❌ <code>"+code+"</code> — topilmadi.", adminKb(aid));
-                return true;
+                sendKb(aid, dbDelMovie(code) ? "✅ <code>"+code+"</code> — o'chirildi!" : "❌ <code>"+code+"</code> — topilmadi!", adminKb(aid)); return;
             }
             states.put(aid, State.WAITING_DEL_CODE);
-            sendText(aid, "❌ <b>Film o'chirish</b>\n\nKodini yuboring:\n\n/cancel"); return true;
+            sendText(aid, "❌ <b>Film o'chirish</b>\n\nKodini yuboring:\n/cancel"); return;
         }
         if (txt.equals("✏️ Film tahrirlash") || txt.equals("/editmovie")) {
             states.put(aid, State.WAITING_EDIT_CODE);
-            sendText(aid, "✏️ <b>Film tahrirlash</b>\n\nFilm kodini yuboring:\n\n/cancel"); return true;
+            sendText(aid, "✏️ <b>Film tahrirlash</b>\n\nFilm kodini yuboring:\n/cancel"); return;
         }
         if (txt.equals("/listmovies") || txt.equals("📋 Filmlar ro'yxati")) {
-            if (movies.isEmpty()) { sendText(aid, "📭 Bazada filmlar yo'q."); return true; }
-            StringBuilder sb = new StringBuilder("🎬 <b>Filmlar ro'yxati</b> (" + movies.size() + " ta)\n━━━━━━━━━━━━━━━━\n");
-            int i = 1;
-            for (Movie m : movies.values()) {
-                sb.append(i++).append(". <code>").append(m.code()).append("</code> — ").append(escHtml(m.title()));
-                if (m.fileIds().size() > 1) sb.append(" (").append(m.fileIds().size()).append(" qism)");
-                sb.append("\n");
-                if (i > 50) { sb.append("\n...va yana ").append(movies.size()-50).append(" ta"); break; }
-            }
-            sendText(aid, sb.toString()); return true;
+            sendMoviesList(aid); return;
         }
         if (txt.equals("/search") || txt.equals("🔍 Film qidirish")) {
             states.put(aid, State.WAITING_SEARCH);
-            sendText(aid, "🔍 Nom yoki kodini yuboring:\n\n/cancel"); return true;
+            sendText(aid, "🔍 <b>Qidirish</b>\n\nNom yoki kodini yuboring:\n/cancel"); return;
         }
         if (txt.equals("/stats") || txt.equals("📊 Statistika")) {
-            sendText(aid, String.format("""
-                📊 <b>Statistika</b>
-                ━━━━━━━━━━━━━━━━━━━━━━━
-                👥 Foydalanuvchilar: <b>%d</b> ta
-                🎬 Filmlar:          <b>%d</b> ta
-                📺 Kanallar:         <b>%d</b> ta
-                🛡 Adminlar:         <b>%d</b> ta
-                ━━━━━━━━━━━━━━━━━━━━━━━
-                💾 Data: %s
-                🤖 @%s""",
-                    countUsers(), movies.size(), channels.size(),
-                    dbListAdmins().size()+1, DATA_DIR, BOT_USERNAME)); return true;
+            long totalParts = movies.values().stream().mapToLong(m -> m.msgRefs().size()).sum();
+            sendText(aid, String.format(
+                "📊 <b>Statistika</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+                "👥 Foydalanuvchilar: <b>%d</b>\n🎬 Filmlar: <b>%d</b>\n" +
+                "📽 Jami qismlar: <b>%d</b>\n📺 Kanallar: <b>%d</b>\n🛡 Adminlar: <b>%d</b>",
+                countUsers(), movies.size(), totalParts, channels.size(), dbListAdmins().size()+1)); return;
         }
         if (txt.equals("/broadcast") || txt.equals("📣 Reklama yuborish")) {
             states.put(aid, State.WAITING_BROADCAST);
-            sendText(aid, "📣 <b>Reklama</b>\n\nXabarni yuboring (matn, rasm, video):\n\n/cancel"); return true;
+            sendText(aid, "📣 <b>Reklama</b>\n\nXabarni yuboring (matn, rasm, video):\n/cancel"); return;
         }
         if (txt.equals("📺 Kanallar") || txt.equals("/channels")) {
-            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return true; }
-            showChannelsList(aid); return true;
+            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return; }
+            showChannelsList(aid); return;
         }
         if (txt.equals("➕ Kanal qo'shish") || txt.equals("/addchannel")) {
-            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return true; }
+            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return; }
             states.put(aid, State.WAITING_CH_NAME);
-            sendText(aid, "📺 <b>Kanal qo'shish</b>\n\n1️⃣ Kanal nomini kiriting:\n\n/cancel"); return true;
+            sendText(aid, "📺 <b>Kanal qo'shish</b>\n\n1️⃣ Kanal nomini kiriting:\n/cancel"); return;
         }
         if (txt.equals("❌ Kanal o'chirish") || txt.equals("/delchannel")) {
-            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return true; }
-            showChannelsDeleteMenu(aid); return true;
+            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return; }
+            showChannelsDeleteMenu(aid); return;
         }
         if (txt.equals("👥 Adminlar") || txt.equals("/admins")) {
-            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return true; }
-            showAdminsList(aid); return true;
+            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return; }
+            showAdminsList(aid); return;
         }
         if (txt.equals("➕ Admin qo'shish") || txt.equals("/addadmin")) {
-            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return true; }
+            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return; }
             states.put(aid, State.WAITING_ADD_ADMIN);
-            sendText(aid, "👥 <b>Admin qo'shish</b>\n\nAdmin Telegram ID sini yuboring:\n\n/cancel"); return true;
+            sendText(aid, "👥 <b>Admin qo'shish</b>\n\nAdmin ID sini yuboring:\n/cancel"); return;
         }
         if (txt.equals("❌ Admin o'chirish") || txt.equals("/deladmin")) {
-            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return true; }
-            showAdminsDeleteMenu(aid); return true;
-        }
-        if (txt.equals("/cancel") || txt.equals("🚫 Bekor qilish")) {
-            states.put(aid, State.NONE); clearPending(aid);
-            sendMsg(aid, "❌ Bekor qilindi.", adminKb(aid)); return true;
+            if (!isSuperAdmin(aid)) { sendText(aid, "⛔ Faqat Super Admin!"); return; }
+            showAdminsDeleteMenu(aid); return;
         }
 
         // ════ VIDEO KELDI ════
-        if (msg.hasVideo() && (st == State.WAITING_VIDEOS || st == State.WAITING_EDIT_VIDEOS)) {
-            String fid  = msg.getVideo().getFileId();
+        if ((msg.hasVideo() || msg.hasDocument()) &&
+                (st == State.WAITING_VIDEOS || st == State.WAITING_EDIT_VIDEOS)) {
             String code = pendingCode.get(aid);
-            if (code == null) { sendText(aid, "⚠️ Avval film kodini kiriting. /addmovie"); return true; }
+            if (code == null) { sendText(aid, "⚠️ Avval film kodini kiriting. /addmovie"); return; }
+
             if (!pendingTitle.containsKey(aid)) {
                 String cap = msg.getCaption();
                 pendingTitle.put(aid, (cap != null && !cap.isBlank()) ? cap.trim() : code);
             }
-            List<String> vids = pendingVids.computeIfAbsent(aid, k -> new ArrayList<>());
-            vids.add(fid);
-            dbSaveMovie(code, pendingTitle.get(aid), new ArrayList<>(vids));
-            sendText(aid, "✅ <b>" + vids.size() + "-qism</b> saqlandi!\n"
-                    + "🔑 Kod: <code>" + code + "</code>\n"
-                    + "🎬 Nomi: <b>" + escHtml(pendingTitle.get(aid)) + "</b>\n\n"
-                    + "📌 Yana video forward qiling yoki /cancel");
-            return true;
+
+            String msgRef = saveMsgRef(msg);
+            List<String> refs = pendingVids.computeIfAbsent(aid, k -> new ArrayList<>());
+            refs.add(msgRef);
+            dbSaveMovie(code, pendingTitle.get(aid), new ArrayList<>(refs));
+
+            sendText(aid,
+                "✅ <b>" + refs.size() + "-qism saqlandi!</b>\n" +
+                "🔑 Kod: <code>" + code + "</code>\n" +
+                "📌 Ref: <code>" + msgRef + "</code>\n\n" +
+                "Yana video yuboring yoki /cancel");
+            return;
         }
 
-        // ════ MATN HOLATLARI ════
-        if (msg.hasText() && !txt.startsWith("/")) {
-            if (st == State.WAITING_CODE) {
-                String code = txt.toUpperCase().replaceAll("[^A-Z0-9_\\-]", "");
-                if (code.isEmpty()) { sendText(aid, "❌ Noto'g'ri kod! Faqat harf va raqam."); return true; }
-                pendingCode.put(aid, code); pendingVids.put(aid, new ArrayList<>()); pendingTitle.remove(aid);
-                states.put(aid, State.WAITING_VIDEOS);
-                sendText(aid, "✅ Kod: <code>" + code + "</code>\n\n2️⃣ Filmni forward qiling:\n"
-                        + "<i>💡 Birinchi videoning caption'i film nomi bo'ladi.</i>\n\n"
-                        + "⚡ Har video kelganda avtomatik saqlanadi!\n\n/cancel"); return true;
-            }
-            if (st == State.WAITING_VIDEOS || st == State.WAITING_EDIT_VIDEOS) {
-                sendText(aid, "⚠️ Video fayl forward qiling!\n/cancel"); return true;
-            }
-            if (st == State.WAITING_DEL_CODE) {
-                String code = txt.toUpperCase().trim();
-                sendMsg(aid, dbDelMovie(code) ? "✅ <code>"+code+"</code> — o'chirildi!" : "❌ <code>"+code+"</code> — topilmadi!", adminKb(aid));
-                states.put(aid, State.NONE); return true;
-            }
-            if (st == State.WAITING_SEARCH) {
-                states.put(aid, State.NONE);
-                List<Movie> res = searchMoviesAdmin(txt);
-                if (res.isEmpty()) { sendMsg(aid, "❌ \"" + escHtml(txt) + "\" topilmadi.", adminKb(aid)); }
-                else {
-                    StringBuilder sb = new StringBuilder("🔍 <b>Natijalar:</b>\n━━━━━━━━━━━━━━━━\n");
-                    for (Movie m : res) {
-                        sb.append("🎬 <code>").append(m.code()).append("</code> — ").append(escHtml(m.title()));
-                        if (m.fileIds().size() > 1) sb.append(" (").append(m.fileIds().size()).append(" qism)");
-                        sb.append("\n");
-                    }
-                    sendMsg(aid, sb.toString(), adminKb(aid));
-                }
-                return true;
-            }
-            if (st == State.WAITING_CH_NAME) {
-                pendingData.put(aid, txt); states.put(aid, State.WAITING_CH_ID);
-                sendText(aid, "✅ Nom: <b>" + escHtml(txt) + "</b>\n\n2️⃣ Kanal ID:\n<code>-1001234567890</code>\n\n/cancel"); return true;
-            }
-            if (st == State.WAITING_CH_ID) {
-                try {
-                    long cid = Long.parseLong(txt.trim());
-                    pendingCode.put(aid, String.valueOf(cid)); states.put(aid, State.WAITING_CH_LINK);
-                    sendText(aid, "✅ ID: <code>" + cid + "</code>\n\n3️⃣ Invite link:\n<code>https://t.me/+xxxxx</code>\n\n/cancel");
-                } catch (NumberFormatException e) { sendText(aid, "❌ Noto'g'ri ID!\nMasalan: <code>-1001234567890</code>"); }
-                return true;
-            }
-            if (st == State.WAITING_CH_LINK) {
-                String name = pendingData.get(aid);
-                long cid = Long.parseLong(pendingCode.get(aid));
-                dbAddChannel(name, cid, txt.trim());
-                sendMsg(aid, "✅ <b>Kanal qo'shildi!</b>\n📺 " + escHtml(name) + "\n🆔 <code>" + cid + "</code>", adminKb(aid));
-                states.put(aid, State.NONE); clearPending(aid); return true;
-            }
-            if (st == State.WAITING_ADD_ADMIN) {
-                try {
-                    long newId = Long.parseLong(txt.trim());
-                    if (newId == SUPER_ADMIN_ID) sendText(aid, "⚠️ Super admin allaqachon!");
-                    else { dbAddAdmin(newId, null, aid); sendMsg(aid, "✅ Admin qo'shildi: <code>" + newId + "</code>", adminKb(aid)); }
-                } catch (NumberFormatException e) { sendText(aid, "❌ Noto'g'ri ID!"); }
-                states.put(aid, State.NONE); return true;
-            }
-            if (st == State.WAITING_EDIT_CODE) {
-                String code = txt.toUpperCase().trim();
-                Movie mv = movies.get(code);
-                if (mv == null) { sendText(aid, "❌ <code>" + code + "</code> topilmadi. Qayta kiriting:"); return true; }
-                pendingCode.put(aid, code);
-                List<List<InlineKeyboardButton>> rows = new ArrayList<>();
-                InlineKeyboardButton b1 = new InlineKeyboardButton(); b1.setText("✏️ Nomini o'zgartirish"); b1.setCallbackData("edit:title:" + code);
-                InlineKeyboardButton b2 = new InlineKeyboardButton(); b2.setText("🔑 Kodini o'zgartirish"); b2.setCallbackData("edit:code:" + code);
-                InlineKeyboardButton b3 = new InlineKeyboardButton(); b3.setText("🎬 Videolarni almashtirish"); b3.setCallbackData("edit:vids:" + code);
-                InlineKeyboardButton b4 = new InlineKeyboardButton(); b4.setText("🚫 Bekor qilish"); b4.setCallbackData("edit:cancel:" + code);
-                rows.add(List.of(b1, b2)); rows.add(List.of(b3)); rows.add(List.of(b4));
-                SendMessage m = new SendMessage(); m.setChatId(String.valueOf(aid));
-                m.setText("✏️ <b>" + code + "</b>\n🎬 " + escHtml(mv.title()) + "\n📽 " + mv.fileIds().size() + " qism\n\nNimani tahrirlaysiz?");
-                m.setParseMode("HTML"); m.setReplyMarkup(new InlineKeyboardMarkup(rows)); exec(m);
-                states.put(aid, State.WAITING_EDIT_FIELD); return true;
-            }
-            if (st == State.WAITING_EDIT_VALUE) {
-                String field = pendingData.get(aid), code = pendingCode.get(aid);
-                if (field != null && code != null) {
-                    if (field.equals("title"))
-                        sendMsg(aid, dbUpdateTitle(code, txt) ? "✅ Nom: <b>\"" + escHtml(txt) + "\"</b>" : "❌ Xatolik!", adminKb(aid));
-                    else if (field.equals("code")) {
-                        String nc = txt.toUpperCase().replaceAll("[^A-Z0-9_\\-]", "");
-                        sendMsg(aid, dbUpdateCode(code, nc) ? "✅ <code>" + code + "</code> → <code>" + nc + "</code>" : "❌ Xatolik!", adminKb(aid));
-                    }
-                }
-                states.put(aid, State.NONE); clearPending(aid); return true;
-            }
-        }
-
-        // ════ 🔧 FIX 1: REKLAMA — userlarga + kanallarga CopyMessage bilan ════
-        if (st == State.WAITING_BROADCAST && (msg.hasText() || msg.hasPhoto() || msg.hasVideo()
-                || msg.hasDocument() || msg.hasAudio() || msg.hasVoice())) {
+        // ════ REKLAMA ════
+        if (st == State.WAITING_BROADCAST &&
+                (msg.hasText() || msg.hasPhoto() || msg.hasVideo() || msg.hasDocument()
+                || msg.hasAudio() || msg.hasVoice())) {
             states.put(aid, State.NONE);
             List<Long> uids = getAllUserIds();
-            sendText(aid, "⏳ " + uids.size() + " ta foydalanuvchiga yuborilmoqda...");
-
+            sendText(aid, "⏳ <b>Yuborilmoqda...</b> " + uids.size() + " foydalanuvchi");
             int ok = 0, fail = 0;
             for (Long uid : uids) {
                 if (isAdmin(uid, null)) continue;
                 try {
                     CopyMessage cp = new CopyMessage();
-                    cp.setChatId(String.valueOf(uid));
-                    cp.setFromChatId(String.valueOf(aid));
-                    cp.setMessageId(msg.getMessageId());
-                    execute(cp);
-                    ok++;
-                    Thread.sleep(50);
+                    cp.setChatId(String.valueOf(uid)); cp.setFromChatId(String.valueOf(aid));
+                    cp.setMessageId(msg.getMessageId()); execute(cp); ok++; sleep(50);
                 } catch (Exception e) { fail++; }
             }
-
-            // Kanallarga yuborish
             int chOk = 0, chFail = 0;
             for (Long chId : BROADCAST_CHANNEL_IDS) {
                 try {
                     CopyMessage cp = new CopyMessage();
-                    cp.setChatId(String.valueOf(chId));
-                    cp.setFromChatId(String.valueOf(aid));
-                    cp.setMessageId(msg.getMessageId());
-                    execute(cp);
-                    chOk++;
-                    Thread.sleep(500);
-                } catch (Exception e) {
-                    chFail++;
-                    System.err.println("Kanal reklama xato " + chId + ": " + e.getMessage());
-                }
+                    cp.setChatId(String.valueOf(chId)); cp.setFromChatId(String.valueOf(aid));
+                    cp.setMessageId(msg.getMessageId()); execute(cp); chOk++; sleep(500);
+                } catch (Exception e) { chFail++; System.err.println("Kanal reklama xato " + chId + ": " + e.getMessage()); }
             }
-
-            sendMsg(aid,
-                "✅ <b>Reklama tugadi!</b>\n\n"
-                + "👥 Foydalanuvchilar: ✅ <b>" + ok + "</b> | ❌ <b>" + fail + "</b>\n"
-                + "📺 Kanallar: ✅ <b>" + chOk + "</b> | ❌ <b>" + chFail + "</b>",
+            sendKb(aid,
+                "✅ <b>Reklama tugadi!</b>\n\n" +
+                "👥 Foydalanuvchilar: ✅ <b>" + ok + "</b> | ❌ <b>" + fail + "</b>\n" +
+                "📺 Kanallar: ✅ <b>" + chOk + "</b> | ❌ <b>" + chFail + "</b>",
                 adminKb(aid));
-            return true;
+            return;
         }
 
-        return false;
+        // ════ MATN HOLATLARI ════
+        if (!msg.hasText() || txt.startsWith("/")) return;
+
+        switch (st) {
+            case WAITING_CODE -> {
+                String code = txt.toUpperCase().replaceAll("[^A-Z0-9_\\-]", "");
+                if (code.isEmpty()) { sendText(aid, "❌ Noto'g'ri kod!"); return; }
+                pendingCode.put(aid, code); pendingVids.put(aid, new ArrayList<>()); pendingTitle.remove(aid);
+                states.put(aid, State.WAITING_VIDEOS);
+                sendText(aid,
+                    "✅ Kod: <code>" + code + "</code>\n\n" +
+                    "2️⃣ Videolarni <b>kanaldan forward qiling:</b>\n\n" +
+                    "• Film joylangan kanalingizga boring\n" +
+                    "• Video xabarni tanlang → Forward\n" +
+                    "• Bu botga yo'naltiring\n\n" +
+                    "⚡ Har video avtomatik saqlanadi!\n/cancel");
+            }
+            case WAITING_VIDEOS, WAITING_EDIT_VIDEOS ->
+                sendText(aid, "⚠️ Video yuboring (kanaldan forward tavsiya etiladi)!\n/cancel");
+
+            case WAITING_DEL_CODE -> {
+                String code = txt.toUpperCase().trim();
+                sendKb(aid, dbDelMovie(code)
+                    ? "✅ <code>"+code+"</code> o'chirildi!"
+                    : "❌ <code>"+code+"</code> topilmadi!", adminKb(aid));
+                states.put(aid, State.NONE);
+            }
+            case WAITING_SEARCH -> {
+                states.put(aid, State.NONE);
+                List<Movie> res = searchMoviesAdmin(txt);
+                if (res.isEmpty()) { sendKb(aid, "❌ \"" + escHtml(txt) + "\" topilmadi.", adminKb(aid)); return; }
+                StringBuilder sb = new StringBuilder("🔍 <b>Natijalar:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n");
+                int i = 1;
+                for (Movie m : res) {
+                    sb.append(i++).append(". <code>").append(m.code()).append("</code> — ").append(escHtml(m.title()));
+                    if (m.msgRefs().size() > 1) sb.append(" <i>(").append(m.msgRefs().size()).append("q)</i>");
+                    sb.append("\n");
+                }
+                sendKb(aid, sb.toString(), adminKb(aid));
+            }
+            case WAITING_CH_NAME -> {
+                pendingData.put(aid, txt + "||");
+                states.put(aid, State.WAITING_CH_ID);
+                sendText(aid, "✅ Nom: <b>" + escHtml(txt) + "</b>\n\n2️⃣ Kanal ID:\n<code>-1001234567890</code>\n\n/cancel");
+            }
+            case WAITING_CH_ID -> {
+                try {
+                    long cid = Long.parseLong(txt.trim());
+                    String name = pendingData.getOrDefault(aid, "Kanal||").split("\\|\\|")[0];
+                    pendingData.put(aid, name + "||" + cid);
+                    states.put(aid, State.WAITING_CH_TYPE);
+                    List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+                    InlineKeyboardButton b1 = new InlineKeyboardButton(); b1.setText("🔐 So'rovli (Request)"); b1.setCallbackData("ch_type:request");
+                    InlineKeyboardButton b2 = new InlineKeyboardButton(); b2.setText("📢 Ochiq (Public)");     b2.setCallbackData("ch_type:public");
+                    rows.add(List.of(b1)); rows.add(List.of(b2));
+                    SendMessage m = new SendMessage(); m.setChatId(String.valueOf(aid));
+                    m.setText("✅ ID: <code>" + cid + "</code>\n\n3️⃣ Kanal turini tanlang:");
+                    m.setParseMode("HTML"); m.setReplyMarkup(new InlineKeyboardMarkup(rows)); execMsg(m);
+                } catch (NumberFormatException e) { sendText(aid, "❌ Noto'g'ri ID!\n<code>-1001234567890</code>"); }
+            }
+            case WAITING_CH_LINK -> {
+                String raw = pendingData.getOrDefault(aid, "||");
+                String[] p = raw.split("\\|\\|", 3);
+                String name   = p.length > 0 ? p[0] : "Kanal";
+                long cid      = p.length > 1 && !p[1].isEmpty() ? Long.parseLong(p[1]) : 0L;
+                boolean isReq = p.length > 2 && p[2].equals("request");
+                dbAddChannel(name, cid, txt.trim(), isReq);
+                sendKb(aid, "✅ <b>Kanal qo'shildi!</b>\n📺 " + escHtml(name)
+                    + "\n🔑 " + (isReq ? "🔐 So'rovli" : "📢 Ochiq"), adminKb(aid));
+                states.put(aid, State.NONE); clearPending(aid);
+            }
+            case WAITING_ADD_ADMIN -> {
+                try {
+                    long newId = Long.parseLong(txt.trim());
+                    if (newId == SUPER_ADMIN_ID) sendText(aid, "⚠️ Super admin allaqachon!");
+                    else { dbAddAdmin(newId, null, aid); sendKb(aid, "✅ Admin: <code>" + newId + "</code>", adminKb(aid)); }
+                } catch (NumberFormatException e) { sendText(aid, "❌ Noto'g'ri ID!"); }
+                states.put(aid, State.NONE);
+            }
+            case WAITING_EDIT_CODE -> {
+                String code = txt.toUpperCase().trim();
+                Movie mv = movies.get(code);
+                if (mv == null) { sendText(aid, "❌ <code>" + code + "</code> topilmadi."); return; }
+                pendingCode.put(aid, code);
+                List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+                InlineKeyboardButton b1 = new InlineKeyboardButton(); b1.setText("✏️ Nomi");    b1.setCallbackData("edit:title:" + code);
+                InlineKeyboardButton b2 = new InlineKeyboardButton(); b2.setText("🔑 Kodi");    b2.setCallbackData("edit:code:"  + code);
+                InlineKeyboardButton b3 = new InlineKeyboardButton(); b3.setText("🎬 Videolar"); b3.setCallbackData("edit:vids:"  + code);
+                InlineKeyboardButton b4 = new InlineKeyboardButton(); b4.setText("🚫 Bekor");   b4.setCallbackData("edit:cancel:" + code);
+                rows.add(List.of(b1, b2)); rows.add(List.of(b3)); rows.add(List.of(b4));
+                SendMessage m = new SendMessage(); m.setChatId(String.valueOf(aid));
+                m.setText("✏️ <b>" + code + "</b> — " + escHtml(mv.title()) + "\n📽 " + mv.msgRefs().size() + " qism\n\nNimani tahrirlaysiz?");
+                m.setParseMode("HTML"); m.setReplyMarkup(new InlineKeyboardMarkup(rows)); execMsg(m);
+                states.put(aid, State.WAITING_EDIT_FIELD);
+            }
+            case WAITING_EDIT_VALUE -> {
+                String field = pendingData.get(aid), code = pendingCode.get(aid);
+                if (field != null && code != null) {
+                    if (field.equals("title"))
+                        sendKb(aid, dbUpdateTitle(code, txt) ? "✅ Nom: <b>\""+escHtml(txt)+"\"</b>" : "❌ Xato!", adminKb(aid));
+                    else if (field.equals("code")) {
+                        String nc = txt.toUpperCase().replaceAll("[^A-Z0-9_\\-]", "");
+                        sendKb(aid, dbUpdateCode(code, nc) ? "✅ <code>"+code+"</code> → <code>"+nc+"</code>" : "❌ Xato!", adminKb(aid));
+                    }
+                }
+                states.put(aid, State.NONE); clearPending(aid);
+            }
+            default -> {}
+        }
+    }
+
+    // ═══ FILMLAR RO'YXATI ════════════════════════════════
+    private void sendMoviesList(long aid) {
+        if (movies.isEmpty()) { sendText(aid, "📭 Bazada filmlar yo'q."); return; }
+        List<Movie> sorted = movies.values().stream()
+                .sorted(Comparator.comparing(Movie::code))
+                .collect(Collectors.toList());
+        int total = sorted.size();
+        String header = "📋 <b>Filmlar ro'yxati</b> — jami <b>" + total + "</b> ta\n━━━━━━━━━━━━━━━━━━━━━━━━\n";
+        StringBuilder cur = new StringBuilder(header);
+        for (int i = 0; i < sorted.size(); i++) {
+            Movie m = sorted.get(i);
+            String line = (i + 1) + ". <code>" + m.code() + "</code> — " + escHtml(m.title());
+            if (m.msgRefs().size() > 1) line += " <i>(" + m.msgRefs().size() + "q)</i>";
+            line += "\n";
+            if (cur.length() + line.length() > MAX_MSG_LEN) {
+                sendText(aid, cur.toString().trim()); sleep(200);
+                cur = new StringBuilder("📋 <b>Davomi...</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n");
+            }
+            cur.append(line);
+        }
+        if (cur.length() > header.length()) sendText(aid, cur.toString().trim());
     }
 
     // ─── YORDAMCHI ──────────────────────────────────────
     private String buildAdminHeader(long uid, String fname) {
-        return "╔════════════════════════════╗\n"
-                + "║  " + (isSuperAdmin(uid) ? "👑 SUPER ADMIN" : "🛡 ADMIN") + "\n"
-                + "║  👤 " + escHtml(fname != null ? fname : "Admin") + "\n"
-                + "║  🆔 " + uid + "\n"
-                + "╚════════════════════════════╝\n\nQuyidagi bo'limlardan birini tanlang:";
+        return "╔══════════════════════════╗\n"
+             + "║  " + (isSuperAdmin(uid) ? "👑 SUPER ADMIN" : "🛡 ADMIN") + "\n"
+             + "║  👤 " + escHtml(fname != null ? fname : "Admin") + "\n"
+             + "║  🆔 <code>" + uid + "</code>\n"
+             + "╚══════════════════════════╝\n\nBo'limni tanlang:";
     }
 
     private void showChannelsList(long aid) {
         if (channels.isEmpty()) { sendText(aid, "📭 Kanallar yo'q."); return; }
-        StringBuilder sb = new StringBuilder("📺 <b>Kanallar</b> (" + channels.size() + " ta)\n━━━━━━━━━━━━━━━━\n");
+        StringBuilder sb = new StringBuilder("📺 <b>Kanallar</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
         int i = 1;
         for (Channel ch : channels)
-            sb.append(i++).append(". <b>").append(escHtml(ch.name())).append("</b>\n")
+            sb.append(i++).append(". ").append(ch.hasJoinRequest() ? "🔐" : "📢")
+                    .append(" <b>").append(escHtml(ch.name())).append("</b>\n")
                     .append("   🆔 <code>").append(ch.id()).append("</code>\n")
                     .append("   🔗 ").append(ch.link()).append("\n\n");
-        sendText(aid, sb.toString());
+        sendText(aid, sb.toString().trim());
     }
 
     private void showChannelsDeleteMenu(long aid) {
@@ -719,32 +894,33 @@ public class Main extends TelegramLongPollingBot {
         List<List<InlineKeyboardButton>> rows = new ArrayList<>();
         for (Channel ch : channels) {
             InlineKeyboardButton b = new InlineKeyboardButton();
-            b.setText("❌ " + ch.name()); b.setCallbackData("del_ch:" + ch.id()); rows.add(List.of(b));
+            b.setText("❌ " + (ch.hasJoinRequest() ? "🔐" : "📢") + " " + ch.name());
+            b.setCallbackData("del_ch:" + ch.id()); rows.add(List.of(b));
         }
         SendMessage m = new SendMessage(); m.setChatId(String.valueOf(aid));
-        m.setText("📺 <b>Qaysi kanalni o'chirasiz?</b>");
-        m.setParseMode("HTML"); m.setReplyMarkup(new InlineKeyboardMarkup(rows)); exec(m);
+        m.setText("📺 <b>Qaysi kanalni o'chirasiz?</b>"); m.setParseMode("HTML");
+        m.setReplyMarkup(new InlineKeyboardMarkup(rows)); execMsg(m);
     }
 
     private void showAdminsList(long aid) {
-        StringBuilder sb = new StringBuilder("👥 <b>Adminlar</b>\n━━━━━━━━━━━━━━━━\n");
-        sb.append("1. 👑 @").append(SUPER_ADMIN_USERNAME).append("\n   🆔 <code>").append(SUPER_ADMIN_ID).append("</code>\n\n");
+        StringBuilder sb = new StringBuilder("👥 <b>Adminlar</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
+        sb.append("1. 👑 @").append(SUPER_ADMIN_USERNAME).append("\n   <code>").append(SUPER_ADMIN_ID).append("</code>\n\n");
         int i = 2;
-        for (long[] a : dbListAdmins()) sb.append(i++).append(". 🛡 <code>").append(a[0]).append("</code>\n");
-        sendText(aid, sb.toString());
+        for (Long id : dbListAdmins()) sb.append(i++).append(". 🛡 <code>").append(id).append("</code>\n");
+        sendText(aid, sb.toString().trim());
     }
 
     private void showAdminsDeleteMenu(long aid) {
-        List<long[]> list = dbListAdmins();
-        if (list.isEmpty()) { sendMsg(aid, "📭 Qo'shimcha adminlar yo'q.", adminKb(aid)); return; }
+        List<Long> list = dbListAdmins();
+        if (list.isEmpty()) { sendKb(aid, "📭 Qo'shimcha adminlar yo'q.", adminKb(aid)); return; }
         List<List<InlineKeyboardButton>> rows = new ArrayList<>();
-        for (long[] a : list) {
+        for (Long id : list) {
             InlineKeyboardButton b = new InlineKeyboardButton();
-            b.setText("❌ Admin: " + a[0]); b.setCallbackData("del_admin:" + a[0]); rows.add(List.of(b));
+            b.setText("❌ Admin: " + id); b.setCallbackData("del_admin:" + id); rows.add(List.of(b));
         }
         SendMessage m = new SendMessage(); m.setChatId(String.valueOf(aid));
-        m.setText("👥 <b>Qaysi adminni o'chirasiz?</b>");
-        m.setParseMode("HTML"); m.setReplyMarkup(new InlineKeyboardMarkup(rows)); exec(m);
+        m.setText("👥 <b>Qaysi adminni o'chirasiz?</b>"); m.setParseMode("HTML");
+        m.setReplyMarkup(new InlineKeyboardMarkup(rows)); execMsg(m);
     }
 
     private void clearPending(long aid) {
@@ -753,15 +929,15 @@ public class Main extends TelegramLongPollingBot {
 
     private String escHtml(String s) {
         if (s == null) return "";
-        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
+
+    private void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) {} }
 
     // ─── KLAVIATURALAR ──────────────────────────────────
     private ReplyKeyboardMarkup userKb() {
-        KeyboardRow r = new KeyboardRow();
-        r.add(new KeyboardButton("🔍 Qidirish"));
-        ReplyKeyboardMarkup kb = new ReplyKeyboardMarkup(List.of(r));
-        kb.setResizeKeyboard(true); return kb;
+        KeyboardRow r = new KeyboardRow(); r.add(new KeyboardButton("🎬 Film kodi"));
+        ReplyKeyboardMarkup kb = new ReplyKeyboardMarkup(List.of(r)); kb.setResizeKeyboard(true); return kb;
     }
 
     private ReplyKeyboardMarkup adminKb(long uid) {
@@ -771,47 +947,42 @@ public class Main extends TelegramLongPollingBot {
         KeyboardRow r3 = new KeyboardRow(); r3.add(new KeyboardButton("🔍 Film qidirish")); r3.add(new KeyboardButton("📊 Statistika")); rows.add(r3);
         KeyboardRow r4 = new KeyboardRow(); r4.add(new KeyboardButton("📣 Reklama yuborish")); r4.add(new KeyboardButton("👑 Admin panel")); rows.add(r4);
         if (isSuperAdmin(uid)) {
-            KeyboardRow r5 = new KeyboardRow(); r5.add(new KeyboardButton("📺 Kanallar")); r5.add(new KeyboardButton("❌ Kanal o'chirish")); rows.add(r5);
-            KeyboardRow r6 = new KeyboardRow(); r6.add(new KeyboardButton("➕ Kanal qo'shish")); r6.add(new KeyboardButton("➕ Admin qo'shish")); rows.add(r6);
+            KeyboardRow r5 = new KeyboardRow(); r5.add(new KeyboardButton("📺 Kanallar")); r5.add(new KeyboardButton("➕ Kanal qo'shish")); rows.add(r5);
+            KeyboardRow r6 = new KeyboardRow(); r6.add(new KeyboardButton("❌ Kanal o'chirish")); r6.add(new KeyboardButton("➕ Admin qo'shish")); rows.add(r6);
             KeyboardRow r7 = new KeyboardRow(); r7.add(new KeyboardButton("👥 Adminlar")); r7.add(new KeyboardButton("❌ Admin o'chirish")); rows.add(r7);
         }
         KeyboardRow r8 = new KeyboardRow(); r8.add(new KeyboardButton("🚫 Bekor qilish")); rows.add(r8);
         ReplyKeyboardMarkup kb = new ReplyKeyboardMarkup(rows); kb.setResizeKeyboard(true); return kb;
     }
 
+    // ─── XABAR YUBORISH ─────────────────────────────────
     private void sendText(long chatId, String text) {
         SendMessage m = new SendMessage();
-        m.setChatId(String.valueOf(chatId)); m.setText(text); m.setParseMode("HTML"); exec(m);
+        m.setChatId(String.valueOf(chatId)); m.setText(text); m.setParseMode("HTML"); execMsg(m);
     }
 
-    private void sendMsg(long chatId, String text, ReplyKeyboard kb) {
+    private void sendKb(long chatId, String text, ReplyKeyboard kb) {
         SendMessage m = new SendMessage();
-        m.setChatId(String.valueOf(chatId)); m.setText(text); m.setParseMode("HTML"); m.setReplyMarkup(kb); exec(m);
+        m.setChatId(String.valueOf(chatId)); m.setText(text); m.setParseMode("HTML"); m.setReplyMarkup(kb); execMsg(m);
     }
 
-    private void exec(BotApiMethod<?> method) {
-        try { execute(method); }
-        catch (TelegramApiException e) { System.err.println("exec xato: " + e.getMessage()); }
+    private void execMsg(SendMessage m) {
+        try { execute(m); } catch (TelegramApiException e) { System.err.println("execMsg: " + e.getMessage()); }
     }
 
     // ─── ISHGA TUSHIRISH ────────────────────────────────
     public static void main(String[] args) {
         System.out.println("🎬 KinoBot ishga tushmoqda...");
-        System.out.println("💾 Data papkasi: " + DATA_DIR);
         try {
             Main bot = new Main();
             bot.initDb();
             bot.loadMoviesFromDb();
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                bot.flushUsers();
-                bot.scheduler.shutdown();
-                System.out.println("💾 Ma'lumotlar saqlandi. Bot to'xtatildi.");
+                bot.flushUsers(); bot.scheduler.shutdown();
+                System.out.println("💾 Bot to'xtatildi.");
             }));
-            TelegramBotsApi api = new TelegramBotsApi(DefaultBotSession.class);
-            api.registerBot(bot);
-            System.out.println("✅ KinoBot ishga tushdi! @" + BOT_USERNAME);
-        } catch (TelegramApiException e) {
-            System.err.println("❌ Xato: " + e.getMessage());
-        }
+            new TelegramBotsApi(DefaultBotSession.class).registerBot(bot);
+            System.out.println("✅ Bot ishga tushdi! @" + BOT_USERNAME);
+        } catch (TelegramApiException e) { System.err.println("❌ " + e.getMessage()); }
     }
 }
