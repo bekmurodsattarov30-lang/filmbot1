@@ -36,7 +36,7 @@ public class Main extends TelegramLongPollingBot {
     // ═══ MUHIM: Videolarni saqlash uchun maxsus kanal ID si
     // Bu kanalga bot admin bo'lishi SHART!
     // O'zingizning saqlash kanalingiz ID sini kiriting:
-    private static final long STORAGE_CHANNEL_ID = -1003618718316; // Birinchi kanalingiz
+    private static final long STORAGE_CHANNEL_ID = -1003618718316L; // Birinchi kanalingiz
 
     private static final int MAX_MSG_LEN = 3800;
 
